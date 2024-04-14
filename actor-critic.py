@@ -13,9 +13,10 @@ dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu
 print(dev)
 
 class PolicyNet(nn.Module):
-    def __init__(self, input_dim, output_dim, min_vals, max_vals, width=16, lr=1, reg_term=1):
+    def __init__(self, input_dim, output_dim, min_vals, max_vals, width=16, lr=1e-5, reg_term=1, track_loss_update=True):
         super().__init__()
         self.reg_term = reg_term
+        self.track_loss_update = track_loss_update
         self.min_vals = torch.tensor(min_vals, dtype=torch.float32)
         self.max_vals = torch.tensor(max_vals, dtype=torch.float32)
         
@@ -31,7 +32,7 @@ class PolicyNet(nn.Module):
         nn.init.xavier_uniform_(self.output_std.weight)
         
         # Define optimizer
-        self.optimizer = optim.Adam(self.parameters(), lr=lr)
+        self.optimizer = optim.SGD(self.parameters(), lr=lr)
 
     def get_dstb_params(self, inputs):
         # Get distribution parameters
@@ -50,24 +51,39 @@ class PolicyNet(nn.Module):
         if qnet is None:
             qnet = lambda *args: 0
         self.optimizer.zero_grad()
-        loss = torch.tensor(0, dtype=torch.float32)
-        loss.requires_grad_(True)
         
-        loss_terms = []
+        def get_loss(loss_terms=None):
+            loss = torch.tensor(0, dtype=torch.float32)
+            loss.requires_grad_(True)
+            
+            loss_terms_precalc = loss_terms is not None
+            
+            if not loss_terms_precalc:
+                loss_terms = []
+            
+            q_est_list = []
+            for states, rewards in zip(_states, _rewards):
+                rs = np.array(rewards)
+                end_qvalue = qnet(states[-1])
+                q_est_list.append(torch.tensor([np.sum(rs[i:]) + end_qvalue for i in range(len(states))]))
+            
+            q_est_mean = torch.mean(torch.tensor([list(t) for t in q_est_list]), 0)
+            for states, actions, q_est in zip(_states, _actions, q_est_list):
+                loss = loss - torch.sum((q_est - q_est_mean) * torch.stack([torch_normal(*self.get_dstb_params(state)).log_prob(action) for state, action in zip(states, actions)]))
+                if not loss_terms_precalc:
+                    loss_terms.append(-torch.sum((q_est - q_est_mean) * torch.stack([torch_normal(*self.get_dstb_params(state)).log_prob(action) for state, action in zip(states, actions)])))
+            
+            if not loss_terms_precalc:
+                loss_terms = torch.tensor(loss_terms).detach()
+            return loss, loss_terms
         
-        for states, actions, rewards in zip(_states, _actions, _rewards):
-            rs = np.array(rewards)
-            end_qvalue = qnet(states[-1])
-            q_est = [np.sum(rs[i:]) + end_qvalue for i in range(len(states))]
-            loss = loss - q_est[0] * torch.sum(torch.stack([torch_normal(*self.get_dstb_params(state)).log_prob(action) for state, action in zip(states, actions)])) # not exactly correct but should behave more stable without qnet or with unstable qnet
-            loss_terms.append(-q_est[0] * torch.sum(torch.stack([torch_normal(*self.get_dstb_params(state)).log_prob(action) for state, action in zip(states, actions)])))
-            # double check this code to make sure the tensors don't lose the gradient
-            # loss = loss - self.reg_term * torch.sum(torch.stack([torch_normal(*self.get_dstb_params(state)).entropy() for state in states]))
-        loss_terms = torch.tensor(loss_terms).detach()
-        loss = (loss - torch.mean(loss_terms)) / torch.std(loss_terms)
+        loss, loss_terms = get_loss()
         loss.backward()
         self.optimizer.step()
-        return loss.item()
+        
+        updated_loss, _ = get_loss(loss_terms) if self.track_loss_update else (None, None)
+        
+        return loss.item(), ((loss - updated_loss) / torch.std(loss_terms)).item() if self.track_loss_update else float('nan')
 
 class QNet(nn.Module):
     def __init__(self, input_dim, width=16):
@@ -88,13 +104,19 @@ class QNet(nn.Module):
         x = self.output(x)
         return x
 
-def actor_critic(n_timesteps, trace_sample_size=30, trace_depth=30, explore_steps=30):
+def actor_critic(n_timesteps, trace_sample_size=15, trace_depth=60, explore_steps=30, policy=None, live_playout=False):
     ref_env = gym.make('Pendulum-v1')
-    policy = PolicyNet(3, 1, [-2], [2])
+
+    if policy is None:
+        policy = get_initial_policy()
+    global _policy
+    _policy = policy
+    
     qnet = None
     state = torch.tensor(ref_env.reset()[0])
     
-    live_play(policy, 'Before training', False)
+    curr_ep_reward = 0
+    full_ep_reward = 0
     
     with tqdm(total=n_timesteps) as env_steps_bar:
         while env_steps_bar.n + trace_depth * trace_sample_size + explore_steps < n_timesteps:
@@ -110,12 +132,22 @@ def actor_critic(n_timesteps, trace_sample_size=30, trace_depth=30, explore_step
                 env_steps_bar.update(trace_depth)
             for env in envs:
                 env.close()     # try to avoid memory leaks
-            loss = policy.update(_states, _actions, _rewards, qnet)
-            env_steps_bar.desc = f'Loss: {loss:3f}'
-            state = env_advance(ref_env, state, policy, explore_steps)
+            loss, improvement = policy.update(_states, _actions, _rewards, qnet)
+            state, rewards, ep_reset = env_advance(ref_env, state, policy, explore_steps)
+            curr_ep_reward += rewards
+            if ep_reset:
+                full_ep_reward = curr_ep_reward
+                curr_ep_reward = 0
+            env_steps_bar.desc = f'Loss: {loss:3f}, Improvement: {improvement:3f}, Last ep reward: {full_ep_reward:3f}'
     ref_env.close()
     
-    live_play(policy, 'After training')
+    if live_playout:
+        live_play(policy, 'After training')
+    
+    return policy
+
+def get_initial_policy():
+    return PolicyNet(3, 1, [-2], [2])
 
 def playout(env, initial_state, policy, trace_depth):
     states = [initial_state]
@@ -127,7 +159,7 @@ def playout(env, initial_state, policy, trace_depth):
         if term or trunc:
             break
         action = policy(state).detach()
-        next_state, reward, term, trunc, _ = env.step(action)
+        next_state, reward, term, trunc, _ = env.step(action.numpy())
         state = torch.tensor(next_state)
         states.append(state)
         actions.append(action)
@@ -136,13 +168,15 @@ def playout(env, initial_state, policy, trace_depth):
 
 def env_advance(env, state, policy, explore_steps):
     term, trunc = False, False
+    acc_rewards = 0
     for _ in range(explore_steps):
         if term or trunc:
-            return torch.tensor(env.reset()[0])
+            return torch.tensor(env.reset()[0]), acc_rewards, True
         action = policy(state).detach()
-        next_state, reward, term, trunc, _ = env.step(action)
+        next_state, reward, term, trunc, _ = env.step(action.numpy())
+        acc_rewards += reward
         state = torch.tensor(next_state)
-    return state
+    return state, acc_rewards, False
 
 def live_play(policy, comment, live=True):
     env = gym.make('Pendulum-v1', render_mode=('human' if live else None))
@@ -151,8 +185,8 @@ def live_play(policy, comment, live=True):
     total_reward = 0
 
     while not term and not trunc:
-        action = policy(state).detach().numpy()
-        next_state, reward, term, trunc, _ = env.step(action)
+        action = policy(state).detach()
+        next_state, reward, term, trunc, _ = env.step(action.numpy())
         next_state = torch.tensor(next_state)
         total_reward += reward
         state = next_state
@@ -160,5 +194,41 @@ def live_play(policy, comment, live=True):
     print(comment, f"Total reward of live episode: {total_reward}", sep=', ')
     env.close()
 
+def evaluate(policy, num_episodes=10, comment=None):
+    env = gym.make('Pendulum-v1')
+    res = []
+    for _ in range(num_episodes):
+        state = torch.tensor(env.reset()[0])
+        term, trunc = False, False
+        total_reward = 0
+
+        while not term and not trunc:
+            action = policy(state).detach()
+            next_state, reward, term, trunc, _ = env.step(action.numpy())
+            next_state = torch.tensor(next_state)
+            total_reward += reward
+            state = next_state
+        res.append(total_reward)
+    env.close()
+    
+    if comment is not None:
+        print(comment, f'For {num_episodes} episodes, mean reward {np.mean(res)}, std {np.std(res)}', sep=', ')
+    
+    return res
+
 if __name__ == '__main__':
-    actor_critic(100000)
+    policy = get_initial_policy()
+    evaluate(policy, comment='Random policy')
+    print()
+    
+    actor_critic(25000, policy=policy)
+    evaluate(policy, comment='Policy after 25k env steps')
+    print()
+    
+    actor_critic(75000, policy=policy)
+    evaluate(policy, comment='Policy after 100k env steps')
+    print()
+    
+    actor_critic(100000, policy=policy, live_playout=True)
+    evaluate(policy, comment='Policy after 200k env steps')
+    print()
