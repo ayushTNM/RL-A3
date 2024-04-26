@@ -32,6 +32,7 @@ class PolicyNet(nn.Module):
         nn.init.xavier_uniform_(self.output_std.weight)
         
         # Define optimizer
+        self.lr = lr
         self.optimizer = optim.SGD(self.parameters(), lr=lr)
 
     def get_dstb_params(self, inputs):
@@ -103,6 +104,32 @@ class QNet(nn.Module):
         x = torch.sigmoid(self.linear2(x))
         x = self.output(x)
         return x
+    
+def update_q_network(_states, _rewards, qnet, lr):
+    qnet_optimizer = optim.Adam(qnet.parameters(), lr=lr)
+    qnet_loss = torch.tensor(0.0)
+    
+    # Initialize total gradient with zeros matching the Q-network parameters
+    # total_grad = [torch.zeros_like(param) for param in qnet.parameters()]
+    
+    for states, rewards in zip(_states, _rewards):
+        # Estimate values of states using Q-network
+        values = qnet(states[0])
+        
+        # Compute temporal difference errors
+        td_errors = rewards[0] - values[0]
+        
+        # Compute gradients of squared TD errors with respect to Q-network parameters
+        qnet.zero_grad()
+        loss = torch.mean(td_errors ** 2)
+        qnet_loss += loss.item()
+        loss.backward()
+        
+    qnet_optimizer.step()
+    
+    return qnet_loss.item()
+
+
 
 def actor_critic(n_timesteps, trace_sample_size=15, trace_depth=60, explore_steps=30, policy=None, live_playout=False):
     ref_env = gym.make('Pendulum-v1')
@@ -112,7 +139,7 @@ def actor_critic(n_timesteps, trace_sample_size=15, trace_depth=60, explore_step
     global _policy
     _policy = policy
     
-    qnet = None
+    qnet = QNet(input_dim=3)
     state = torch.tensor(ref_env.reset()[0])
     
     curr_ep_reward = 0
@@ -132,13 +159,14 @@ def actor_critic(n_timesteps, trace_sample_size=15, trace_depth=60, explore_step
                 env_steps_bar.update(trace_depth)
             for env in envs:
                 env.close()     # try to avoid memory leaks
-            loss, improvement = policy.update(_states, _actions, _rewards, qnet)
+            policy_loss, improvement = policy.update(_states, _actions, _rewards, qnet)
+            q_loss = update_q_network(_states, _rewards, qnet, policy.lr)
             state, rewards, ep_reset = env_advance(ref_env, state, policy, explore_steps)
             curr_ep_reward += rewards
             if ep_reset:
                 full_ep_reward = curr_ep_reward
                 curr_ep_reward = 0
-            env_steps_bar.desc = f'Loss: {loss:3f}, Improvement: {improvement:3f}, Last ep reward: {full_ep_reward:3f}'
+            env_steps_bar.desc = f'Loss: {policy_loss:3f}, {q_loss:3f}, Improvement: {improvement:3f}, Last ep reward: {full_ep_reward:3f}'
     ref_env.close()
     
     if live_playout:
