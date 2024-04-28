@@ -1,242 +1,194 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions.normal import Normal as torch_normal
-import gymnasium as gym
-import copy
 import numpy as np
 from tqdm import tqdm
-import random as rn
-import argparse
+import gymnasium as gym
+import matplotlib.pyplot as plt
+from gymnasium.wrappers import RecordEpisodeStatistics, NormalizeObservation
 
-dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-print(dev)
+def create_env(env_name, rm = None):
+    env = gym.make(env_name, render_mode = rm)
+    env = RecordEpisodeStatistics(env)
+    env = NormalizeObservation(env)         # Might remove later if not explicitly needed
+    return env
 
-class PolicyNet(nn.Module):
-    def __init__(self, input_dim, output_dim, min_vals, max_vals, width=16, lr=1e-5, reg_term=1, track_loss_update=True):
-        super().__init__()
-        self.reg_term = reg_term
-        self.track_loss_update = track_loss_update
-        self.min_vals = torch.tensor(min_vals, dtype=torch.float32)
-        self.max_vals = torch.tensor(max_vals, dtype=torch.float32)
+# Define the policy network
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, lr = 1e-3, hidden_size=64):
+        super(PolicyNetwork, self).__init__()
+        self.input = nn.Linear(state_dim, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, hidden_size)
+        self.linear4 = nn.Linear(hidden_size, hidden_size)
+        self.linear5 = nn.Linear(hidden_size, hidden_size)
+        self.linear6 = nn.Linear(hidden_size, hidden_size)
+        self.mean_layer = nn.Linear(hidden_size, action_dim)
+        self.std_layer = nn.Linear(hidden_size, action_dim)
         
-        self.linear1 = nn.Linear(input_dim, width)
-        self.linear2 = nn.Linear(width, width)
-        self.output_mean = nn.Linear(width, output_dim)
-        self.output_std = nn.Linear(width, output_dim)
+        self.optim = optim.Adam(self.parameters(), lr=lr)
 
-        # Initialization using Xavier
-        nn.init.xavier_uniform_(self.linear1.weight)
-        nn.init.xavier_uniform_(self.linear2.weight)
-        nn.init.xavier_uniform_(self.output_mean.weight)
-        nn.init.xavier_uniform_(self.output_std.weight)
-        
-        # Define optimizer
-        self.lr = lr
-        self.optimizer = optim.SGD(self.parameters(), lr=lr)
-
-    def get_dstb_params(self, inputs):
-        # Get distribution parameters
-        x = torch.sigmoid(self.linear1(inputs))
-        x = torch.sigmoid(self.linear2(x))
-        means = self.min_vals + torch.sigmoid(self.output_mean(x)) * (self.max_vals - self.min_vals)
-        stds = (torch.sigmoid(self.output_std(x)) + 0.1) * (self.max_vals - self.min_vals)  # +0.1 temp hack to avoid mode collapse
-        return means, stds
-
-    def forward(self, inputs):
-        # Forward pass through the layers with sigmoid activation
-        means, stds = self.get_dstb_params(inputs)
-        return torch.normal(means, stds)
+    def forward(self, x):
+        x = torch.relu(self.input(x))
+        x = torch.relu(self.linear2(x))
+        x = torch.relu(self.linear3(x))
+        x = torch.relu(self.linear4(x))
+        x = torch.relu(self.linear5(x))
+        x = torch.relu(self.linear6(x))
+        mean = self.mean_layer(x)
+        std = torch.exp(self.std_layer(x)) # To keep positive
+        return mean, std
     
-    def update(self, _states, _actions, _rewards, qnet=None):
-        if qnet is None:
-            qnet = lambda *args: 0
-        self.optimizer.zero_grad()
-        
-        def get_loss(loss_terms=None):
-            loss = torch.tensor(0, dtype=torch.float32)
-            loss.requires_grad_(True)
-            
-            loss_terms_precalc = loss_terms is not None
-            
-            if not loss_terms_precalc:
-                loss_terms = []
-            
-            q_est_list = []
-            for states, rewards in zip(_states, _rewards):
-                rs = np.array(rewards)
-                end_qvalue = qnet(states[-1])
-                q_est_list.append(torch.tensor([np.sum(rs[i:]) + end_qvalue for i in range(len(states))]))
-            
-            q_est_mean = torch.mean(torch.tensor([list(t) for t in q_est_list]), 0)
-            for states, actions, q_est in zip(_states, _actions, q_est_list):
-                loss = loss - torch.sum((q_est - q_est_mean) * torch.stack([torch_normal(*self.get_dstb_params(state)).log_prob(action) for state, action in zip(states, actions)]))
-                if not loss_terms_precalc:
-                    loss_terms.append(-torch.sum((q_est - q_est_mean) * torch.stack([torch_normal(*self.get_dstb_params(state)).log_prob(action) for state, action in zip(states, actions)])))
-            
-            if not loss_terms_precalc:
-                loss_terms = torch.tensor(loss_terms).detach()
-            return loss, loss_terms
-        
-        loss, loss_terms = get_loss()
+    def backprop(self, loss):
+        self.optim.zero_grad()
         loss.backward()
-        self.optimizer.step()
+        self.optim.step()
         
-        updated_loss, _ = get_loss(loss_terms) if self.track_loss_update else (None, None)
-        
-        return loss.item(), ((loss - updated_loss) / torch.std(loss_terms)).item() if self.track_loss_update else float('nan')
-
-class QNet(nn.Module):
-    def __init__(self, input_dim, width=16):
+class ValueNetwork(nn.Module):
+    def __init__(self, input_dim, action_dim, lr = 1e-3, hidden_size=64):
         super().__init__()
-        self.linear1 = nn.Linear(input_dim, width)
-        self.linear2 = nn.Linear(width, width)
-        self.output = nn.Linear(width, 1)
+        self.linear1 = nn.Linear(input_dim + action_dim, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, hidden_size)
+        self.linear4 = nn.Linear(hidden_size, hidden_size)
+        self.linear5 = nn.Linear(hidden_size, hidden_size)
+        self.linear6 = nn.Linear(hidden_size, hidden_size)
+        self.output = nn.Linear(hidden_size, 1)
+        
+        self.optim = optim.Adam(self.parameters(), lr=lr)
+        self.loss= nn.MSELoss()
 
-        # Initialization using Xavier
-        nn.init.xavier_uniform_(self.linear1.weight)
-        nn.init.xavier_uniform_(self.linear2.weight)
-        nn.init.xavier_uniform_(self.output.weight)
-
-    def forward(self, inputs):
+    def forward(self, inputs, a):
         # Forward pass through the layers with sigmoid activation
-        x = torch.sigmoid(self.linear1(inputs))
-        x = torch.sigmoid(self.linear2(x))
+        x = torch.relu(self.linear1(torch.cat([inputs, a], axis=1)))
+        x = torch.relu(self.linear2(x))
+        x = torch.relu(self.linear3(x))
+        x = torch.relu(self.linear4(x))
+        x = torch.relu(self.linear5(x))
+        x = torch.relu(self.linear6(x))
         x = self.output(x)
         return x
     
-def update_q_network(_states, _rewards, qnet, lr):
-    qnet_optimizer = optim.Adam(qnet.parameters(), lr=lr)
-    qnet_loss = torch.tensor(0.0)
-    
-    # Initialize total gradient with zeros matching the Q-network parameters
-    # total_grad = [torch.zeros_like(param) for param in qnet.parameters()]
-    
-    for states, rewards in zip(_states, _rewards):
-        # Estimate values of states using Q-network
-        values = qnet(states[0])
-        
-        # Compute temporal difference errors
-        td_errors = rewards[0] - values[0]
-        
-        # Compute gradients of squared TD errors with respect to Q-network parameters
-        qnet.zero_grad()
-        loss = torch.mean(td_errors ** 2)
-        qnet_loss += loss.item()
+    def backprop(self, loss):
+        self.optim.zero_grad()
         loss.backward()
+        self.optim.step()
+
+# actor-critic algorithm with entropy regularization
+def actor_critic(env_name, num_episodes=50_000, n = 100, pol_lr=1e-4, val_lr=1e-3, gamma=0.99, entropy_coef=0.01, eval_interval = 100):
+    env = create_env(env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    policy_network = PolicyNetwork(state_dim, action_dim, lr = pol_lr)
+    value_network = ValueNetwork(state_dim, action_dim, lr = val_lr)
+    eval_timesteps, eval_returns = [], []
+
+    progress_bar = tqdm(range(num_episodes))
+    
+    bootstrap = True
+    baseline_substraction = True
+
+    for episode in progress_bar:
+        log_probs = []
+        rewards = []
+        entropies = []
         
-    qnet_optimizer.step()
-    
-    return qnet_loss.item()
+        if episode % eval_interval == 0:
+            eval_returns.append(evaluate(env_name, policy_network))
+            eval_timesteps.append(episode)
 
+        state, info = env.reset()
+        states, actions, means, stds, = [], [], [], []
+        done = False
 
+        while not done:
+            mean, std = policy_network(torch.FloatTensor(state))
+            action_dist = torch.distributions.Normal(mean, std)
+            action = action_dist.rsample()
+            log_prob = action_dist.log_prob(action)
+            action = torch.clamp(torch.tanh(action), env.action_space.low[0],env.action_space.high[0])
+            next_state, reward, term, trunc, info = env.step(action.detach().numpy())
+            done = term or trunc
+            state = next_state
+            states.append(torch.FloatTensor(state))
+            actions.append(action)
+            entropies.append(action_dist.entropy())
+            log_probs.append(log_prob)
+            rewards.append(reward)
+            
+        with torch.no_grad():
+            Qs = rewards * gamma**np.arange(len(rewards))    # Discounted rewards
+            if bootstrap:
+                for t in range(len(rewards)):
+                    if t + n < len(rewards):
+                        Qs[t] = np.sum(Qs[t:t+n] + (gamma**(t+n))) * value_network(states[t+n].view(1, -1), actions[t+n].view(1, -1)).item()
+                    else:
+                        Qs[t] = np.sum(Qs[t:t+n] * (gamma**np.arange(t, len(rewards))))
+                        
+            value_loss = torch.mean(value_network.loss(torch.tensor(Qs).unsqueeze(1), value_network(torch.stack(states), torch.stack(actions))))
 
-def actor_critic(n_timesteps, trace_sample_size=15, trace_depth=60, explore_steps=30, policy=None, live_playout=False):
-    ref_env = gym.make('Pendulum-v1')
+            if baseline_substraction:
+                Qs = Qs - value_network(torch.stack(states), torch.stack(actions)).squeeze().numpy()
+                
+            policy_loss = - torch.stack(log_probs) * Qs
+            policy_loss = torch.mean(policy_loss - (entropy_coef * torch.stack(entropies)))  # Add entropy regularization term
 
-    if policy is None:
-        policy = get_initial_policy()
-    global _policy
-    _policy = policy
-    
-    qnet = QNet(input_dim=3)
-    state = torch.tensor(ref_env.reset()[0])
-    
-    curr_ep_reward = 0
-    full_ep_reward = 0
-    
-    with tqdm(total=n_timesteps) as env_steps_bar:
-        while env_steps_bar.n + trace_depth * trace_sample_size + explore_steps < n_timesteps:
-            envs = [copy.deepcopy(ref_env) for _ in range(trace_sample_size)]
-            _states = []
-            _actions = []
-            _rewards = []
-            for env in envs:
-                states, actions, rewards = playout(env, state, policy, trace_depth) 
-                _states.append(states)
-                _actions.append(actions)
-                _rewards.append(rewards)
-                env_steps_bar.update(trace_depth)
-            for env in envs:
-                env.close()     # try to avoid memory leaks
-            policy_loss, improvement = policy.update(_states, _actions, _rewards, qnet)
-            q_loss = update_q_network(_states, _rewards, qnet, policy.lr)
-            state, rewards, ep_reset = env_advance(ref_env, state, policy, explore_steps)
-            curr_ep_reward += rewards
-            if ep_reset:
-                full_ep_reward = curr_ep_reward
-                curr_ep_reward = 0
-            env_steps_bar.desc = f'Loss: {policy_loss:3f}, {q_loss:3f}, Improvement: {improvement:3f}, Last ep reward: {full_ep_reward:3f}'
-    ref_env.close()
-    
-    if live_playout:
-        live_play(policy, 'After training')
-    
-    return policy
+        # Descent value loss
+        value_loss.requires_grad = True
+        value_network.backprop(value_loss)
 
-def get_initial_policy():
-    return PolicyNet(3, 1, [-2], [2])
+        # Ascent policy gradient
+        policy_loss.requires_grad = True
+        policy_network.backprop(policy_loss)
 
-def playout(env, initial_state, policy, trace_depth):
-    states = [initial_state]
-    actions = []
-    rewards = []
-    state = initial_state
-    term, trunc = False, False
-    for _ in range(trace_depth):
+        # Print episode statistics
+        progress_bar.desc = f"episode: {episode}, rew. {info['episode']['r'][0]}"
+        
+    
+
+    env.close()
+    
+    return policy_network, eval_returns, eval_timesteps
+    
+def playout(policy, env_name):
+    env = create_env(env_name, "rgb_array")
+    # env.action_space.seed(42)
+    env = gym.wrappers.RecordVideo(env=env, video_folder='./', name_prefix="act-crit")
+
+    state, _ = env.reset()
+
+    env.start_video_recorder()
+    
+    for _ in range(1000):
+        mean, std = policy(torch.tensor(state))
+        action_dist = torch.distributions.Normal(mean, std)
+        action = torch.clamp(torch.tanh(action_dist.rsample()), env.action_space.low[0],env.action_space.high[0])
+
+        next_state, reward, term, trunc, _ = env.step(action.detach().numpy())
+
         if term or trunc:
             break
-        action = policy(state).detach()
-        next_state, reward, term, trunc, _ = env.step(action.numpy())
-        state = torch.tensor(next_state)
-        states.append(state)
-        actions.append(action)
-        rewards.append(reward)
-    return states, actions, rewards
-
-def env_advance(env, state, policy, explore_steps):
-    term, trunc = False, False
-    acc_rewards = 0
-    for _ in range(explore_steps):
-        if term or trunc:
-            return torch.tensor(env.reset()[0]), acc_rewards, True
-        action = policy(state).detach()
-        next_state, reward, term, trunc, _ = env.step(action.numpy())
-        acc_rewards += reward
-        state = torch.tensor(next_state)
-    return state, acc_rewards, False
-
-def live_play(policy, comment, live=True):
-    env = gym.make('Pendulum-v1', render_mode=('human' if live else None))
-    state = torch.tensor(env.reset()[0])
-    term, trunc = False, False
-    total_reward = 0
-
-    while not term and not trunc:
-        action = policy(state).detach()
-        next_state, reward, term, trunc, _ = env.step(action.numpy())
-        next_state = torch.tensor(next_state)
-        total_reward += reward
-        state = next_state
-    
-    print(comment, f"Total reward of live episode: {total_reward}", sep=', ')
+        else:
+            state = next_state
+    env.close_video_recorder()
     env.close()
-
-def evaluate(policy, num_episodes=10, comment=None):
-    env = gym.make('Pendulum-v1')
+    
+    
+def evaluate(env_name, policy, num_episodes=100, comment=None):
+    env = create_env(env_name)
     res = []
     for _ in range(num_episodes):
-        state = torch.tensor(env.reset()[0])
+        state, info = env.reset()
         term, trunc = False, False
-        total_reward = 0
 
         while not term and not trunc:
-            action = policy(state).detach()
-            next_state, reward, term, trunc, _ = env.step(action.numpy())
-            next_state = torch.tensor(next_state)
-            total_reward += reward
+            mean, std = policy(torch.FloatTensor(state))
+            action_dist = torch.distributions.Normal(mean, std)
+            action = torch.clamp(torch.tanh(action_dist.rsample()), env.action_space.low[0],env.action_space.high[0])
+
+            next_state, _, term, trunc, info = env.step(action.detach().numpy())
             state = next_state
-        res.append(total_reward)
+        res.append(info['episode']['r'][0])
     env.close()
     
     if comment is not None:
@@ -244,19 +196,24 @@ def evaluate(policy, num_episodes=10, comment=None):
     
     return res
 
-if __name__ == '__main__':
-    policy = get_initial_policy()
-    evaluate(policy, comment='Random policy')
-    print()
-    
-    actor_critic(25000, policy=policy)
-    evaluate(policy, comment='Policy after 25k env steps')
-    print()
-    
-    actor_critic(75000, policy=policy)
-    evaluate(policy, comment='Policy after 100k env steps')
-    print()
-    
-    actor_critic(100000, policy=policy, live_playout=True)
-    evaluate(policy, comment='Policy after 200k env steps')
-    print()
+# Run actor-critic algorithm
+env_name = "Pendulum-v1"
+env = create_env(env_name)
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.shape[0]
+policy = PolicyNetwork(state_dim, action_dim)
+evaluate(env_name,policy, comment="Random Policy")
+
+policy, rets, stps = actor_critic(env_name)
+evaluate(env_name,policy, comment="Policy after approx. 200k env steps")
+
+# Plotting
+plt.plot(stps, np.mean(rets,axis=1))
+plt.xlabel('Timesteps')
+plt.ylabel('Returns')
+plt.title('Returns vs Timesteps')
+plt.grid(True)
+plt.savefig("test.pdf")
+# plt.show()
+
+playout(policy, env_name)
