@@ -4,87 +4,175 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 import gymnasium as gym
+import matplotlib.pyplot as plt
+
+GYM_ID = "Pendulum-v1"
 
 # Define the policy network
 class PolicyNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_size=32):
+    def __init__(self, state_dim, action_dim, hidden_size=128):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_size)
-        # self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.mean = nn.Linear(hidden_size, action_dim)
-        self.std = nn.Linear(hidden_size, action_dim)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, hidden_size)
+        self.mean_layer = nn.Linear(hidden_size, action_dim)
+        self.std_layer = nn.Linear(hidden_size, action_dim)
+        
+        # Initialization using Xavier
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.xavier_uniform_(self.fc3.weight)
+        nn.init.xavier_uniform_(self.mean_layer.weight)
+        nn.init.xavier_uniform_(self.std_layer.weight)
 
     def forward(self, x):
-        x = torch.tanh(self.fc1(x))
-        # x = torch.tanh(self.fc2(x))
-        mean = self.mean(x)
-        std = torch.exp(self.std(x)) # To keep positive
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = torch.relu(self.fc3(x))
+        mean = self.mean_layer(x)
+        std = torch.exp(self.std_layer(x)) # To keep positive
         return mean, std
 
 # REINFORCE algorithm with entropy regularization
-def reinforce(env_name, num_episodes=1000, lr=0.01, gamma=0.99, entropy_coef=0.01):
-    env = gym.make(env_name)
+def reinforce(env, policy = None, num_timesteps=250000, lr=0.0001, gamma=0.92, entropy_coef=0.01):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    policy_network = PolicyNetwork(state_dim, action_dim)
-    optimizer = optim.Adam(policy_network.parameters(), lr=lr)
+    if policy == None:
+        policy = PolicyNetwork(state_dim, action_dim)
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
 
-    progrss_bar = tqdm(range(num_episodes))
+    progress_bar = tqdm(range(num_timesteps))
 
-    for episode in progrss_bar:
-        log_probs = []
-        rewards = []
+    state, _ = env.reset()
+    episode = 1
+    log_probs = []
+    rewards = []
+    episode_reward = 0
+    done = False
+    eval_timesteps, eval_returns = [], []
+    eval_interval = 2500
+    for ts in progress_bar:
+        if ts % eval_interval == 0:
+            eval_returns.append(evaluate(policy))
+            eval_timesteps.append(ts)
+            
+        mean, std = policy(torch.FloatTensor(state))
+        action_dist = torch.distributions.Normal(mean, std)
+        action = action_dist.sample()
+        log_prob = action_dist.log_prob(action)
+        action = torch.clamp(action, env.action_space.low[0], env.action_space.high[0])
+        # print(action)
+        next_state, reward, term, trunc, _ = env.step(action.detach().numpy())
+        episode_reward += reward
+        log_probs.append(log_prob)
+        rewards.append(reward)
+        done = term or trunc
+        if done:
+            episode+=1
+            
+            progress_bar.desc = f"episode: {episode}, rew. {episode_reward}"
+            # Calculate discounted rewards
+            discounted_rewards = []
+            R = 0
+            for r in rewards[::-1]:
+                R = r + gamma * R
+                discounted_rewards.insert(0, R)
 
-        # for _ in range(batch_size):
-        state, _ = env.reset()
-        done = False
-        episode_reward = 0
+            # Calculate loss
+            loss = 0
+            for log_prob, R in zip(log_probs, discounted_rewards):
+                loss -= (log_prob * R)
+            loss = torch.sum(loss)
+            # Add entropy regularization
+            entropy = torch.mean(0.5 * torch.log(2 * np.pi * std**2)) # Compute the entropy of the Gaussian action distribution
+            loss += entropy_coef * entropy
 
-        while not done:
-            state[2] /= 8   # normalize anfular velocity
-            mean, std = policy_network(torch.FloatTensor(state))
+            # Update policy network
+            optimizer.zero_grad()
+            # print(loss)
+            loss.backward()
+            optimizer.step()
+            
+            state, _ = env.reset()
+            log_probs = []
+            rewards = []
+            episode_reward = 0
+            done = False
+        else:
+            state = next_state
+
+    env.close()
+    return policy, eval_returns, eval_timesteps
+    
+def playout(policy, env_name):
+    env = gym.make(env_name, render_mode="rgb_array")
+    # env.action_space.seed(42)
+    env = gym.wrappers.RecordVideo(env=env, video_folder='./', name_prefix="test-video")
+
+    state, info = env.reset()
+
+    env.start_video_recorder()
+    
+    for _ in range(1000):
+        state, reward, term, trunc, info = env.step(env.action_space.sample())
+        mean, std = policy(torch.FloatTensor(state))
+        action_dist = torch.distributions.Normal(mean, std)
+        action = action_dist.sample()
+        action = torch.clamp(action, env.action_space.low[0], env.action_space.high[0])
+        # print(action)
+        next_state, reward, term, trunc, _ = env.step(action.detach().numpy())
+
+        if term or trunc:
+            break
+        else:
+            state = next_state
+    env.close_video_recorder()
+    env.close()
+    
+    
+def evaluate(policy, num_episodes=100, comment=None):
+    env = gym.make(GYM_ID)
+    res = []
+    for _ in range(num_episodes):
+        state = torch.tensor(env.reset()[0])
+        term, trunc = False, False
+        total_reward = 0
+
+        while not term and not trunc:
+            mean, std = policy(torch.FloatTensor(state))
             action_dist = torch.distributions.Normal(mean, std)
             action = action_dist.sample()
-            log_prob = action_dist.log_prob(action)
             action = torch.clamp(action, env.action_space.low[0], env.action_space.high[0])
             # print(action)
             next_state, reward, term, trunc, _ = env.step(action.detach().numpy())
-            done = term or trunc
-            log_probs.append(log_prob)
-            rewards.append(reward)
+            next_state = torch.tensor(next_state)
+            total_reward += reward
             state = next_state
-            episode_reward += reward
-
-        # Calculate discounted rewards
-        discounted_rewards = []
-        R = 0
-        for r in rewards[::-1]:
-            R = r + gamma * R
-            discounted_rewards.insert(0, R)
-
-        # Normalize discounted rewards
-        discounted_rewards = torch.FloatTensor(discounted_rewards)
-        discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-9)
-
-        # Calculate loss
-        loss = 0
-        for log_prob, R in zip(log_probs, discounted_rewards):
-            loss -= (log_prob * R)
-
-        # Add entropy regularization
-        entropy = torch.mean(0.5 * torch.log(2 * np.pi * std**2)) # Compute the entropy of the Gaussian action distribution
-        loss += entropy_coef * entropy
-
-        # Update policy network
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # Print episode statistics
-        if episode % 10 == 0:
-            print(f"Episode {episode}, Reward: {episode_reward}")
-
+        res.append(total_reward)
     env.close()
+    
+    if comment is not None:
+        print(comment, f'For {num_episodes} episodes, mean reward {np.mean(res)}, std {np.std(res)}', sep=', ')
+    
+    return res
 
 # Run REINFORCE algorithm
-reinforce("Pendulum-v1")
+env = gym.make(GYM_ID)
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.shape[0]
+policy = PolicyNetwork(state_dim, action_dim)
+evaluate(policy, comment="Random Policy")
+
+policy, rets, stps = reinforce(env)
+evaluate(policy, comment="Policy after approx. 200k env steps")
+
+# Plotting
+plt.plot(stps, np.mean(rets,axis=1))
+plt.xlabel('Timesteps')
+plt.ylabel('Returns')
+plt.title('Returns vs Timesteps')
+plt.grid(True)
+plt.savefig("test.pdf")
+# plt.show()
+
+playout(policy, "LunarLander-v2")
