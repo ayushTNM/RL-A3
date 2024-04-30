@@ -45,9 +45,9 @@ class PolicyNetwork(nn.Module):
         self.optim.step()
         
 class ValueNetwork(nn.Module):
-    def __init__(self, input_dim, action_dim, lr = 1e-3, hidden_size=64):
+    def __init__(self, input_dim, lr = 1e-3, hidden_size=64):
         super().__init__()
-        self.linear1 = nn.Linear(input_dim + action_dim, hidden_size)
+        self.linear1 = nn.Linear(input_dim, hidden_size)
         self.linear2 = nn.Linear(hidden_size, hidden_size)
         self.linear3 = nn.Linear(hidden_size, hidden_size)
         self.linear4 = nn.Linear(hidden_size, hidden_size)
@@ -58,9 +58,9 @@ class ValueNetwork(nn.Module):
         self.optim = optim.Adam(self.parameters(), lr=lr)
         self.loss= nn.MSELoss()
 
-    def forward(self, inputs, a):
+    def forward(self, x):
         # Forward pass through the layers with sigmoid activation
-        x = torch.relu(self.linear1(torch.cat([inputs, a], axis=1)))
+        x = torch.relu(self.linear1(x))
         x = torch.relu(self.linear2(x))
         x = torch.relu(self.linear3(x))
         x = torch.relu(self.linear4(x))
@@ -75,77 +75,87 @@ class ValueNetwork(nn.Module):
         self.optim.step()
 
 # actor-critic algorithm with entropy regularization
-def actor_critic(env_name, num_episodes=50_000, n = 100, pol_lr=1e-4, val_lr=1e-3, gamma=0.99, entropy_coef=0.01, eval_interval = 100):
+def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 2000):
     env = create_env(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     policy_network = PolicyNetwork(state_dim, action_dim, lr = pol_lr)
-    value_network = ValueNetwork(state_dim, action_dim, lr = val_lr)
+    value_network = ValueNetwork(state_dim, lr = val_lr)
     eval_timesteps, eval_returns = [], []
 
-    progress_bar = tqdm(range(num_episodes))
+    progress_bar = tqdm(range(num_timesteps))
     
     bootstrap = True
     baseline_substraction = True
 
-    for episode in progress_bar:
-        log_probs = []
-        rewards = []
-        entropies = []
+    state, info = env.reset()
+    states, actions, log_probs, rewards, entropies = [], [], [], [], []
+    done = False
+    episode = 1
+
+    for ts in progress_bar:
         
-        if episode % eval_interval == 0:
+        if ts % eval_interval == 0:
             eval_returns.append(evaluate(env_name, policy_network))
-            eval_timesteps.append(episode)
+            eval_timesteps.append(ts)
 
-        state, info = env.reset()
-        states, actions, means, stds, = [], [], [], []
-        done = False
+        mean, std = policy_network(torch.FloatTensor(state))
+        action_dist = torch.distributions.Normal(mean, std)
+        action = action_dist.sample()
+        log_prob = action_dist.log_prob(action)
+        action = torch.clamp(torch.tanh(action), env.action_space.low[0],env.action_space.high[0])
+        next_state, reward, term, trunc, info = env.step(action.detach().numpy())
+        done = term or trunc
+        states.append(torch.FloatTensor(next_state))
+        actions.append(action)
+        entropies.append(action_dist.entropy())
+        log_probs.append(log_prob)
+        rewards.append(reward)
 
-        while not done:
-            mean, std = policy_network(torch.FloatTensor(state))
-            action_dist = torch.distributions.Normal(mean, std)
-            action = action_dist.rsample()
-            log_prob = action_dist.log_prob(action)
-            action = torch.clamp(torch.tanh(action), env.action_space.low[0],env.action_space.high[0])
-            next_state, reward, term, trunc, info = env.step(action.detach().numpy())
-            done = term or trunc
-            state = next_state
-            states.append(torch.FloatTensor(state))
-            actions.append(action)
-            entropies.append(action_dist.entropy())
-            log_probs.append(log_prob)
-            rewards.append(reward)
+        if done:
+            episode+=1
+            # Print episode statistics
+            progress_bar.desc = f"episode: {episode}, rew. {info['episode']['r'][0]}"
             
-        with torch.no_grad():
+            values = value_network(torch.stack(states))
             Qs = rewards * gamma**np.arange(len(rewards))    # Discounted rewards
-            if bootstrap:
-                for t in range(len(rewards)):
-                    if t + n < len(rewards):
-                        Qs[t] = np.sum(Qs[t:t+n] + (gamma**(t+n))) * value_network(states[t+n].view(1, -1), actions[t+n].view(1, -1)).item()
-                    else:
-                        Qs[t] = np.sum(Qs[t:t+n] * (gamma**np.arange(t, len(rewards))))
-                        
-            value_loss = torch.mean(value_network.loss(torch.tensor(Qs).unsqueeze(1), value_network(torch.stack(states), torch.stack(actions))))
+            
+            emperical_Qs = []
+            for ind_Q in range(len(Qs)):
+                emperical_Qs.append(np.sum(Qs[ind_Q:]))
+            
+            with torch.no_grad():
+                if bootstrap:
+                    for t in range(len(rewards)):
+                        if t + n < len(rewards):
+                            Qs[t] = np.sum(Qs[t:t+n]) + (values[t+n].item() * gamma**(t+n))
+                        else:
+                            Qs[t] = np.sum(Qs[t:t+n])
+                            
+            value_loss = torch.sum(value_network.loss(torch.FloatTensor(Qs).unsqueeze(1), values))
+            
+            with torch.no_grad():
+                if baseline_substraction:
+                    Qs = Qs - values.squeeze().numpy()
+                    
+            policy_loss = - torch.tensor(log_probs) * Qs
+            policy_loss = torch.sum(policy_loss + (entropy_coef * torch.tensor(entropies)))  # Add entropy regularization term
 
-            if baseline_substraction:
-                Qs = Qs - value_network(torch.stack(states), torch.stack(actions)).squeeze().numpy()
-                
-            policy_loss = - torch.stack(log_probs) * Qs
-            policy_loss = torch.mean(policy_loss - (entropy_coef * torch.stack(entropies)))  # Add entropy regularization term
+            
+            # Descent value loss
+            value_network.backprop(value_loss)
 
-        # Descent value loss
-        value_loss.requires_grad = True
-        value_network.backprop(value_loss)
-
-        # Ascent policy gradient
-        policy_loss.requires_grad = True
-        policy_network.backprop(policy_loss)
-
-        # Print episode statistics
-        progress_bar.desc = f"episode: {episode}, rew. {info['episode']['r'][0]}"
-        
-    
-
+            print(np.mean(emperical_Qs),np.mean((np.array(emperical_Qs) - value_network(torch.stack(states)).squeeze().detach().numpy())))
+            
+            # Ascent policy gradient
+            policy_loss.requires_grad = True
+            policy_network.backprop(policy_loss)
+            
+            state, info = env.reset()
+            states, actions, log_probs, rewards, entropies = [], [], [], [], []
+            done = False
+        else:
+            state = next_state
     env.close()
     
     return policy_network, eval_returns, eval_timesteps
@@ -160,9 +170,9 @@ def playout(policy, env_name):
     env.start_video_recorder()
     
     for _ in range(1000):
-        mean, std = policy(torch.tensor(state))
+        mean, std = policy(torch.FloatTensor(state))
         action_dist = torch.distributions.Normal(mean, std)
-        action = torch.clamp(torch.tanh(action_dist.rsample()), env.action_space.low[0],env.action_space.high[0])
+        action = torch.clamp(torch.tanh(action_dist.sample()), env.action_space.low[0],env.action_space.high[0])
 
         next_state, reward, term, trunc, _ = env.step(action.detach().numpy())
 
@@ -184,7 +194,7 @@ def evaluate(env_name, policy, num_episodes=100, comment=None):
         while not term and not trunc:
             mean, std = policy(torch.FloatTensor(state))
             action_dist = torch.distributions.Normal(mean, std)
-            action = torch.clamp(torch.tanh(action_dist.rsample()), env.action_space.low[0],env.action_space.high[0])
+            action = torch.clamp(torch.tanh(action_dist.sample()), env.action_space.low[0],env.action_space.high[0])
 
             next_state, _, term, trunc, info = env.step(action.detach().numpy())
             state = next_state

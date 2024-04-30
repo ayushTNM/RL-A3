@@ -5,8 +5,13 @@ import numpy as np
 from tqdm import tqdm
 import gymnasium as gym
 import matplotlib.pyplot as plt
+from gymnasium.wrappers import RecordEpisodeStatistics, NormalizeObservation
 
-GYM_ID = "Pendulum-v1"
+def create_env(env_name, rm = None):
+    env = gym.make(env_name, render_mode = rm)
+    env = RecordEpisodeStatistics(env)
+    env = NormalizeObservation(env)         # Might remove later if not explicitly needed
+    return env
 
 # Define the policy network
 class PolicyNetwork(nn.Module):
@@ -34,7 +39,8 @@ class PolicyNetwork(nn.Module):
         return mean, std
 
 # REINFORCE algorithm with entropy regularization
-def reinforce(env, policy = None, num_timesteps=250000, lr=0.0001, gamma=0.92, entropy_coef=0.01):
+def reinforce(env_name, policy = None, num_timesteps=200_000, lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 2000):
+    env = create_env(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     if policy == None:
@@ -43,17 +49,16 @@ def reinforce(env, policy = None, num_timesteps=250000, lr=0.0001, gamma=0.92, e
 
     progress_bar = tqdm(range(num_timesteps))
 
-    state, _ = env.reset()
+    state, info = env.reset()
     episode = 1
     log_probs = []
     rewards = []
-    episode_reward = 0
+    entropies = []
     done = False
     eval_timesteps, eval_returns = [], []
-    eval_interval = 2500
     for ts in progress_bar:
         if ts % eval_interval == 0:
-            eval_returns.append(evaluate(policy))
+            eval_returns.append(evaluate(env_name, policy))
             eval_timesteps.append(ts)
             
         mean, std = policy(torch.FloatTensor(state))
@@ -62,41 +67,41 @@ def reinforce(env, policy = None, num_timesteps=250000, lr=0.0001, gamma=0.92, e
         log_prob = action_dist.log_prob(action)
         action = torch.clamp(action, env.action_space.low[0], env.action_space.high[0])
         # print(action)
-        next_state, reward, term, trunc, _ = env.step(action.detach().numpy())
-        episode_reward += reward
+        next_state, reward, term, trunc, info = env.step(action.detach().numpy())
         log_probs.append(log_prob)
         rewards.append(reward)
+        entropies.append(action_dist.entropy())
         done = term or trunc
         if done:
             episode+=1
             
-            progress_bar.desc = f"episode: {episode}, rew. {episode_reward}"
+            progress_bar.desc = f"episode: {episode}, rew. {info['episode']['r'][0]}"
+            
             # Calculate discounted rewards
-            discounted_rewards = []
-            R = 0
+            Qs = []
+            Q = 0
             for r in rewards[::-1]:
-                R = r + gamma * R
-                discounted_rewards.insert(0, R)
-
+                Q = r + gamma * Q
+                Qs.insert(0, Q)
+            
             # Calculate loss
-            loss = 0
-            for log_prob, R in zip(log_probs, discounted_rewards):
-                loss -= (log_prob * R)
-            loss = torch.sum(loss)
+            loss = - torch.tensor(log_probs) * torch.tensor(Qs)
+                        
             # Add entropy regularization
-            entropy = torch.mean(0.5 * torch.log(2 * np.pi * std**2)) # Compute the entropy of the Gaussian action distribution
-            loss += entropy_coef * entropy
+            # entropy = torch.mean(0.5 * torch.log(2 * np.pi * std**2)) # Compute the entropy of the Gaussian action distribution
+            loss = torch.sum(loss + (entropy_coef * torch.tensor(entropies)))
 
             # Update policy network
             optimizer.zero_grad()
             # print(loss)
+            loss.requires_grad = True
             loss.backward()
             optimizer.step()
             
             state, _ = env.reset()
             log_probs = []
             rewards = []
-            episode_reward = 0
+            entropies = []
             done = False
         else:
             state = next_state
@@ -105,16 +110,15 @@ def reinforce(env, policy = None, num_timesteps=250000, lr=0.0001, gamma=0.92, e
     return policy, eval_returns, eval_timesteps
     
 def playout(policy, env_name):
-    env = gym.make(env_name, render_mode="rgb_array")
+    env = create_env(env_name, rm="rgb_array")
     # env.action_space.seed(42)
-    env = gym.wrappers.RecordVideo(env=env, video_folder='./', name_prefix="test-video")
+    env = gym.wrappers.RecordVideo(env=env, video_folder='./', name_prefix="reinforce")
 
-    state, info = env.reset()
+    state, _ = env.reset()
 
     env.start_video_recorder()
     
     for _ in range(1000):
-        state, reward, term, trunc, info = env.step(env.action_space.sample())
         mean, std = policy(torch.FloatTensor(state))
         action_dist = torch.distributions.Normal(mean, std)
         action = action_dist.sample()
@@ -130,8 +134,8 @@ def playout(policy, env_name):
     env.close()
     
     
-def evaluate(policy, num_episodes=100, comment=None):
-    env = gym.make(GYM_ID)
+def evaluate(env_name, policy, num_episodes=100, comment=None):
+    env = create_env(env_name)
     res = []
     for _ in range(num_episodes):
         state = torch.tensor(env.reset()[0])
@@ -157,14 +161,15 @@ def evaluate(policy, num_episodes=100, comment=None):
     return res
 
 # Run REINFORCE algorithm
-env = gym.make(GYM_ID)
+env_name = "Pendulum-v1"
+env = create_env(env_name)
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.shape[0]
 policy = PolicyNetwork(state_dim, action_dim)
-evaluate(policy, comment="Random Policy")
+evaluate(env_name, policy, comment="Random Policy")
 
-policy, rets, stps = reinforce(env)
-evaluate(policy, comment="Policy after approx. 200k env steps")
+policy, rets, stps = reinforce(env_name)
+evaluate(env_name, policy, comment="Policy after approx. 200k env steps")
 
 # Plotting
 plt.plot(stps, np.mean(rets,axis=1))
@@ -175,4 +180,4 @@ plt.grid(True)
 plt.savefig("test.pdf")
 # plt.show()
 
-playout(policy, "LunarLander-v2")
+playout(policy, env_name)
