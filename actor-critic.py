@@ -75,7 +75,7 @@ class ValueNetwork(nn.Module):
         self.optim.step()
 
 # actor-critic algorithm with entropy regularization
-def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 2000):
+def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000):
     env = create_env(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -114,8 +114,6 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
 
         if done:
             episode+=1
-            # Print episode statistics
-            progress_bar.desc = f"episode: {episode}, rew. {info['episode']['r'][0]}"
             
             values = value_network(torch.stack(states))
             Qs = rewards * gamma**np.arange(len(rewards))    # Discounted rewards
@@ -145,11 +143,15 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
             # Descent value loss
             value_network.backprop(value_loss)
 
-            print(np.mean(emperical_Qs),np.mean((np.array(emperical_Qs) - value_network(torch.stack(states)).squeeze().detach().numpy())))
+            emp_abs_qvalue = np.mean(np.abs(emperical_Qs))
+            mean_abs_diff_qvalue = np.mean(np.abs(np.array(emperical_Qs) - value_network(torch.stack(states)).squeeze().detach().numpy()))
             
             # Ascent policy gradient
             policy_loss.requires_grad = True
             policy_network.backprop(policy_loss)
+            
+            # Print episode statistics
+            progress_bar.desc = f"episode: {episode}, rew. {info['episode']['r'][0]:.5}, qvalue model/emp error {(mean_abs_diff_qvalue / emp_abs_qvalue):.5}"
             
             state, info = env.reset()
             states, actions, log_probs, rewards, entropies = [], [], [], [], []
