@@ -75,7 +75,7 @@ class ValueNetwork(nn.Module):
         self.optim.step()
 
 # actor-critic algorithm with entropy regularization
-def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000):
+def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000, bootstrap=True, baseline_substraction=True):
     env = create_env(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -84,9 +84,6 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
     eval_timesteps, eval_returns = [], []
 
     progress_bar = tqdm(range(num_timesteps))
-    
-    bootstrap = True
-    baseline_substraction = True
 
     state, info = env.reset()
     states, actions, log_probs, rewards, entropies = [], [], [], [], []
@@ -95,7 +92,7 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
 
     for ts in progress_bar:
         
-        if ts % eval_interval == 0:
+        if eval_interval is not None and ts % eval_interval == 0:
             eval_returns.append(evaluate(env_name, policy_network))
             eval_timesteps.append(ts)
 
@@ -116,20 +113,22 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
             episode+=1
             
             values = value_network(torch.stack(states))
-            Qs = rewards * gamma**np.arange(len(rewards))    # Discounted rewards
             
             emperical_Qs = []
-            for ind_Q in range(len(Qs)):
-                emperical_Qs.append(np.sum(Qs[ind_Q:]))
+            for ind_Q in range(len(rewards)):
+                emperical_Qs.append(np.sum(rewards[ind_Q:] * gamma**np.arange(len(rewards) - ind_Q)))
             
             with torch.no_grad():
+                Qs = np.zeros(len(rewards))
                 if bootstrap:
                     for t in range(len(rewards)):
                         if t + n < len(rewards):
-                            Qs[t] = np.sum(Qs[t:t+n]) + (values[t+n].item() * gamma**(t+n))
+                            Qs[t] = np.sum(rewards[t:t+n] * gamma**np.arange(n)) + (values[t+n].item() * gamma**n)
                         else:
-                            Qs[t] = np.sum(Qs[t:t+n])
-                            
+                            Qs[t] = np.sum(rewards[t:] * gamma**np.arange(len(rewards) - t))
+                else:
+                    Qs = np.array(emperical_Qs)
+            
             value_loss = torch.sum(value_network.loss(torch.FloatTensor(Qs).unsqueeze(1), values))
             
             with torch.no_grad():
@@ -142,7 +141,8 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
             
             # Descent value loss
             value_network.backprop(value_loss)
-
+            
+            
             emp_abs_qvalue = np.mean(np.abs(emperical_Qs))
             mean_abs_diff_qvalue = np.mean(np.abs(np.array(emperical_Qs) - value_network(torch.stack(states)).squeeze().detach().numpy()))
             
