@@ -23,21 +23,20 @@ class PolicyNetwork(nn.Module):
         self.linear4 = nn.Linear(hidden_size, hidden_size)
         self.linear5 = nn.Linear(hidden_size, hidden_size)
         self.linear6 = nn.Linear(hidden_size, hidden_size)
-        self.mean_layer = nn.Linear(hidden_size, action_dim)
-        self.std_layer = nn.Linear(hidden_size, action_dim)
+        self.distrib = nn.Linear(hidden_size, 3)    # not generic, change later
         
         self.optim = optim.Adam(self.parameters(), lr=lr)
 
     def forward(self, x):
         x = torch.relu(self.input(x))
         x = torch.relu(self.linear2(x))
-        x = torch.relu(self.linear3(x))
-        x = torch.relu(self.linear4(x))
-        x = torch.relu(self.linear5(x))
-        x = torch.relu(self.linear6(x))
-        mean = self.mean_layer(x)
-        std = torch.exp(self.std_layer(x)) # To keep positive
-        return mean, std
+        if None:
+            x = torch.relu(self.linear3(x))
+            x = torch.relu(self.linear4(x))
+            x = torch.relu(self.linear5(x))
+            x = torch.relu(self.linear6(x))
+        x = torch.softmax(self.distrib(x), dim=-1)  # not sure about dimension    
+        return x
     
     def backprop(self, loss):
         self.optim.zero_grad()
@@ -96,17 +95,16 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
             eval_returns.append(evaluate(env_name, policy_network))
             eval_timesteps.append(ts)
 
-        mean, std = policy_network(torch.FloatTensor(state))
-        action_dist = torch.distributions.Normal(mean, std)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action)
+        action_dist = policy_network(torch.FloatTensor(state))
+        action = torch.multinomial(action_dist, 1)  # again, not generic, replace
+        log_prob = torch.log(action_dist[action[0]])
         # action = torch.clamp(torch.tanh(action), env.action_space.low[0],env.action_space.high[0])
-        action = env.action_space.low[0] + (torch.tanh(action) + 1) / 2 * (env.action_space.high[0] - env.action_space.low[0])
+        action = env.action_space.low[0] + action / 2 * (env.action_space.high[0] - env.action_space.low[0])
         next_state, reward, term, trunc, info = env.step(action.detach().numpy())
         done = term or trunc
         states.append(torch.FloatTensor(next_state))
         actions.append(action)
-        entropies.append(action_dist.entropy())
+        entropies.append(-torch.sum(action_dist * torch.log(action_dist)))
         log_probs.append(log_prob)
         rewards.append(reward)
 
@@ -137,7 +135,7 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
                     Qs = Qs - values.squeeze().numpy()
                     
             policy_loss = - torch.tensor(log_probs) * Qs
-            policy_loss = torch.sum(policy_loss + (entropy_coef * torch.tensor(entropies)))  # Add entropy regularization term
+            policy_loss = torch.sum(policy_loss)    # ignore entropy for now + (entropy_coef * torch.tensor(entropies)))  # Add entropy regularization term
 
             
             # Descent value loss
@@ -173,10 +171,12 @@ def playout(policy, env_name):
     env.start_video_recorder()
     
     for _ in range(1000):
-        mean, std = policy(torch.FloatTensor(state))
-        action_dist = torch.distributions.Normal(mean, std)
-        # action = torch.clamp(torch.tanh(action_dist.sample()), env.action_space.low[0],env.action_space.high[0])
-        action = env.action_space.low[0] + (torch.tanh(action_dist.sample()) + 1) / 2 * (env.action_space.high[0] - env.action_space.low[0])
+        action_dist = policy(torch.FloatTensor(state))
+        action = torch.multinomial(action_dist, 1)  # again, not generic, replace
+        # action = torch.argmax(action_dist, keepdim=True)  # again, not generic, replace
+        log_prob = torch.log(action_dist[action[0]])
+        # action = torch.clamp(torch.tanh(action), env.action_space.low[0],env.action_space.high[0])
+        action = env.action_space.low[0] + action / 2 * (env.action_space.high[0] - env.action_space.low[0])
 
         next_state, reward, term, trunc, _ = env.step(action.detach().numpy())
 
@@ -196,10 +196,12 @@ def evaluate(env_name, policy, num_episodes=100, comment=None):
         term, trunc = False, False
 
         while not term and not trunc:
-            mean, std = policy(torch.FloatTensor(state))
-            action_dist = torch.distributions.Normal(mean, std)
-            # action = torch.clamp(torch.tanh(action_dist.sample()), env.action_space.low[0],env.action_space.high[0])
-            action = env.action_space.low[0] + (torch.tanh(action_dist.sample()) + 1) / 2 * (env.action_space.high[0] - env.action_space.low[0])
+            action_dist = policy(torch.FloatTensor(state))
+            # action = torch.argmax(action_dist, keepdim=True)  # again, not generic, replace
+            action = torch.multinomial(action_dist, 1)  # again, not generic, replace
+            log_prob = torch.log(action_dist[action[0]])
+            # action = torch.clamp(torch.tanh(action), env.action_space.low[0],env.action_space.high[0])
+            action = env.action_space.low[0] + action / 2 * (env.action_space.high[0] - env.action_space.low[0])
 
             next_state, _, term, trunc, info = env.step(action.detach().numpy())
             state = next_state
@@ -219,7 +221,7 @@ action_dim = env.action_space.shape[0]
 policy = PolicyNetwork(state_dim, action_dim)
 evaluate(env_name,policy, comment="Random Policy")
 
-policy, rets, stps = actor_critic(env_name, num_timesteps=1_000_000, eval_interval=40_000, bootstrap=False, baseline_substraction=False)
+policy, rets, stps = actor_critic(env_name, num_timesteps=1_000_000, eval_interval=40_000, bootstrap=True, baseline_substraction=True)
 evaluate(env_name,policy, comment="Policy after approx. 200k env steps")
 
 # Plotting
