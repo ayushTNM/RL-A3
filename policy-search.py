@@ -14,7 +14,7 @@ def create_env(env_name, rm = None):
 
 # Define the policy network
 class PolicyNetwork(nn.Module):
-    def __init__(self, state_space, action_space, lr = None, hidden_count = 2, hidden_size=128):
+    def __init__(self, state_space, action_space, lr = None, hidden_count = 2, hidden_size=64):
         super(PolicyNetwork, self).__init__()
         
         self.is_discrete = isinstance(action_space, gym.spaces.Discrete)
@@ -29,7 +29,7 @@ class PolicyNetwork(nn.Module):
         self.input_layer = nn.Linear(state_dim, hidden_size)
         
         # Hidden layers  with relu activations
-        self.hidden_layers = nn.Sequential(*([nn.Linear(hidden_size, hidden_size), nn.ReLU()] * hidden_count))
+        self.hidden_layers = nn.Sequential(*[nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU()) for _ in range(hidden_count)])
             
         # Output layer
         self.mean_layer = nn.Linear(hidden_size, action_dim)
@@ -68,7 +68,7 @@ class PolicyNetwork(nn.Module):
         
         
 class ValueNetwork(nn.Module):
-    def __init__(self, state_space, lr = None, hidden_count = 2, hidden_size = 128):
+    def __init__(self, state_space, lr = None, hidden_count = 2, hidden_size = 64):
         super().__init__()
         state_dim = state_space.shape[0]
         
@@ -76,7 +76,7 @@ class ValueNetwork(nn.Module):
         self.input_layer = nn.Linear(state_dim, hidden_size)
         
         # Hidden layers with relu activations
-        self.hidden_layers = nn.Sequential(*([nn.Linear(hidden_size, hidden_size), nn.ReLU()] * hidden_count))
+        self.hidden_layers = nn.Sequential(*[nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU()) for _ in range(hidden_count)])
         
         # Output layer
         self.output_layer = nn.Linear(hidden_size, 1)
@@ -167,7 +167,7 @@ def policy_search(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1
 
             # Ascent policy gradient
             policy_loss = - torch.stack(log_probs) * torch.tensor(advantages)
-            policy_loss = torch.sum(policy_loss + (entropy_coef * torch.tensor(entropies)))  # Add entropy regularization term
+            policy_loss = torch.sum(policy_loss + (entropy_coef * torch.stack(entropies)))  # Add entropy regularization term
             policy_net.backprop(policy_loss)
             
             state, info = env.reset()
@@ -234,7 +234,7 @@ if __name__ == "__main__":
     num_timesteps = 1_000_000
     
     # Reinforce
-    policy, rets, stps = reinforce(env_name, num_timesteps=num_timesteps, eval_interval=40_000, bootstrap=True, baseline_substraction=True)
+    policy, rets, stps = reinforce(env_name, num_timesteps=num_timesteps, eval_interval=40_000)
     evaluate(env_name,policy, comment=f"Policy after {num_timesteps} evaluation steps")
 
     # Plotting
