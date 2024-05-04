@@ -123,7 +123,7 @@ def policy_search(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1
     env = create_env(env_name)
     
     policy_net = PolicyNetwork(env.observation_space, env.action_space, lr = pol_lr)
-    value_net = ValueNetwork(env.observation_space, lr = val_lr)
+    value_net = ValueNetwork(env.observation_space, lr = val_lr) if bootstrap or baseline_substraction else None
     eval_timesteps, eval_returns = [], []
     log_probs = []
 
@@ -155,7 +155,8 @@ def policy_search(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1
             # Print episode statistics
             progress_bar.desc = f"episode: {episode}, rew. {info['episode']['r'][0]:.5}"
             
-            values = value_net(torch.stack(states))
+            if bootstrap or baseline_substraction:
+                values = value_net(torch.stack(states))
             
             emperical_Qs = []
             for ind_Q in range(len(rewards)):
@@ -198,17 +199,17 @@ def policy_search(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1
             state = next_state
     env.close()
     
-    return policy_net, eval_returns, eval_timesteps
+    return policy_net, value_net, eval_returns, eval_timesteps
 
     
-def playout(env_name, policy_net, file_prefix, record = True):
+def playout(env_name, policy_net, file_prefix, file_folder='', record = True):
     env = create_env(env_name, "rgb_array")
 
     state, _ = env.reset()
     term, trunc = False, False
 
     if record:
-        env = gym.wrappers.RecordVideo(env=env, video_folder='./', name_prefix=file_prefix)
+        env = gym.wrappers.RecordVideo(env=env, video_folder=file_folder, name_prefix=file_prefix)
         env.start_video_recorder()
     
     while not term and not trunc:
@@ -242,8 +243,8 @@ def evaluate(env_name, policy_net = None, num_episodes=10, comment=None):
     
     return res
 
-def reinforce(env_name, num_timesteps=200_000, n = 30, lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000):
-    return policy_search(env_name, num_timesteps, n, lr, None, gamma, entropy_coef, eval_interval, bootstrap=False, baseline_substraction=False)
+def reinforce(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000):
+    return policy_search(env_name, num_timesteps, n, pol_lr, None, gamma, entropy_coef, eval_interval, bootstrap=False, baseline_substraction=False)
 
 def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000, bootstrap=True, baseline_substraction=True):
     return policy_search(env_name, num_timesteps, n, pol_lr, val_lr, gamma, entropy_coef, eval_interval, bootstrap, baseline_substraction)
@@ -253,10 +254,10 @@ if __name__ == "__main__":
     evaluate(env_name, comment="Random Policy")
     
     num_timesteps = 1_000_000
-    eval_interval = num_timesteps/100
+    eval_interval = num_timesteps//100
     
     # Reinforce
-    policy, rets, stps = reinforce(env_name, num_timesteps=num_timesteps, eval_interval=eval_interval)
+    policy, _, rets, stps = reinforce(env_name, num_timesteps=num_timesteps, eval_interval=eval_interval)
     evaluate(env_name,policy, comment=f"Policy after {num_timesteps} evaluation steps")
 
     # Plotting
@@ -267,10 +268,10 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.savefig("reinforce.pdf")
 
-    playout(env_name, policy, "reinforce")
+    playout(env_name, policy, file_prefix="reinforce")
     
     # Actor-critic
-    policy, rets, stps = actor_critic(env_name, num_timesteps=num_timesteps, eval_interval=eval_interval, bootstrap=True, baseline_substraction=True)
+    policy, value, rets, stps = actor_critic(env_name, num_timesteps=num_timesteps, eval_interval=eval_interval, bootstrap=True, baseline_substraction=True)
     evaluate(env_name,policy, comment=f"Policy after {num_timesteps} evaluation steps")
 
     # Plotting
@@ -281,4 +282,4 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.savefig("actor-critic.pdf")
 
-    playout(env_name, policy, "actor-critic")
+    playout(env_name, policy, file_prefix="actor-critic")
