@@ -242,8 +242,8 @@ def evaluate(env_name, policy_net = None, num_episodes=10, comment=None):
     
     return res
 
-def reinforce(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000):
-    return policy_search(env_name, num_timesteps, n, pol_lr, val_lr, gamma, entropy_coef, eval_interval, bootstrap=False, baseline_substraction=False)
+def reinforce(env_name, num_timesteps=200_000, n = 30, lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000):
+    return policy_search(env_name, num_timesteps, n, lr, None, gamma, entropy_coef, eval_interval, bootstrap=False, baseline_substraction=False)
 
 def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01, eval_interval = 5000, bootstrap=True, baseline_substraction=True):
     return policy_search(env_name, num_timesteps, n, pol_lr, val_lr, gamma, entropy_coef, eval_interval, bootstrap, baseline_substraction)
