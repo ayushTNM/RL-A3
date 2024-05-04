@@ -187,8 +187,8 @@ def policy_search(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1
                 progress_bar.desc += f", qvalue model/emp error {(mean_abs_diff_qvalue / emp_abs_qvalue):.5}"
 
             # Ascent policy gradient
-            policy_loss = - torch.stack(log_probs) * torch.tensor(advantages)
-            policy_loss = torch.sum(policy_loss + (entropy_coef * torch.stack(entropies)))  # Add entropy regularization term
+            policy_loss = - torch.stack(log_probs) * torch.tensor(advantages / np.std(advantages))
+            policy_loss = torch.sum(policy_loss - (entropy_coef * torch.stack(entropies)))  # Add entropy regularization term
             policy_net.backprop(policy_loss)
             
             state, info = env.reset()
