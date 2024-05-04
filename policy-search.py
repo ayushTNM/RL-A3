@@ -8,13 +8,34 @@ import matplotlib.pyplot as plt
 from gymnasium.wrappers import RecordEpisodeStatistics
 
 def create_env(env_name, rm = None):
-    env = gym.make(env_name, render_mode = rm)
+    env = gym.make(gym_name(env_name), render_mode = rm)
     env = RecordEpisodeStatistics(env)
+    
+    if env_name == "Pendulum-discrete":
+        env = pendulum_discrete_wrapper(env)
+    return env
+
+def gym_name(env_name):
+    return env_name if env_name != "Pendulum-discrete" else "Pendulum-v1"
+
+class Wrapper:
+    def __init__(self, inner):
+        self.inner = inner
+    
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+def pendulum_discrete_wrapper(env):
+    env = Wrapper(env)
+    low = env.action_space.low[0]
+    high = env.action_space.high[0]
+    env.action_space = gym.spaces.Discrete(3)
+    env.step = lambda action: env.inner.step(low + np.array([action]) / 2 * (high - low))
     return env
 
 # Define the policy network
 class PolicyNetwork(nn.Module):
-    def __init__(self, state_space, action_space, lr = None, hidden_count = 2, hidden_size=128):
+    def __init__(self, state_space, action_space, lr = None, hidden_count = 2, hidden_size=64):
         super(PolicyNetwork, self).__init__()
         
         self.is_discrete = isinstance(action_space, gym.spaces.Discrete)
@@ -29,7 +50,7 @@ class PolicyNetwork(nn.Module):
         self.input_layer = nn.Linear(state_dim, hidden_size)
         
         # Hidden layers  with relu activations
-        self.hidden_layers = nn.Sequential(*([nn.Linear(hidden_size, hidden_size), nn.ReLU()] * hidden_count))
+        self.hidden_layers = nn.Sequential(*sum([[nn.Linear(hidden_size, hidden_size), nn.ReLU()] for _ in range(hidden_count)], []))
             
         # Output layer
         self.mean_layer = nn.Linear(hidden_size, action_dim)
@@ -68,7 +89,7 @@ class PolicyNetwork(nn.Module):
         
         
 class ValueNetwork(nn.Module):
-    def __init__(self, state_space, lr = None, hidden_count = 2, hidden_size = 128):
+    def __init__(self, state_space, lr = None, hidden_count = 2, hidden_size = 64):
         super().__init__()
         state_dim = state_space.shape[0]
         
@@ -76,7 +97,7 @@ class ValueNetwork(nn.Module):
         self.input_layer = nn.Linear(state_dim, hidden_size)
         
         # Hidden layers with relu activations
-        self.hidden_layers = nn.Sequential(*([nn.Linear(hidden_size, hidden_size), nn.ReLU()] * hidden_count))
+        self.hidden_layers = nn.Sequential(*sum([[nn.Linear(hidden_size, hidden_size), nn.ReLU()] for _ in range(hidden_count)], []))
         
         # Output layer
         self.output_layer = nn.Linear(hidden_size, 1)
@@ -228,7 +249,7 @@ def actor_critic(env_name, num_timesteps=200_000, n = 30, pol_lr=1e-3, val_lr=1e
     return policy_search(env_name, num_timesteps, n, pol_lr, val_lr, gamma, entropy_coef, eval_interval, bootstrap, baseline_substraction)
 
 if __name__ == "__main__":
-    env_name = "LunarLander-v2" # "Pendulum-v1"
+    env_name = "Pendulum-discrete" # "LunarLander-v2", "Pendulum-v1", "Pendulum-discrete"
     evaluate(env_name, comment="Random Policy")
     
     num_timesteps = 1_000_000
