@@ -253,9 +253,10 @@ if __name__ == "__main__":
     evaluate(env_name, comment="Random Policy")
     
     num_timesteps = 1_000_000
+    eval_interval = num_timesteps/100
     
     # Reinforce
-    policy, rets, stps = reinforce(env_name, num_timesteps=num_timesteps, eval_interval=40_000)
+    policy, rets, stps = reinforce(env_name, num_timesteps=num_timesteps, eval_interval=eval_interval)
     evaluate(env_name,policy, comment=f"Policy after {num_timesteps} evaluation steps")
 
     # Plotting
@@ -269,7 +270,7 @@ if __name__ == "__main__":
     playout(env_name, policy, "reinforce")
     
     # Actor-critic
-    policy, rets, stps = actor_critic(env_name, num_timesteps=num_timesteps, eval_interval=40_000, bootstrap=True, baseline_substraction=True)
+    policy, rets, stps = actor_critic(env_name, num_timesteps=num_timesteps, eval_interval=eval_interval, bootstrap=True, baseline_substraction=True)
     evaluate(env_name,policy, comment=f"Policy after {num_timesteps} evaluation steps")
 
     # Plotting
