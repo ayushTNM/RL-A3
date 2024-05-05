@@ -30,7 +30,7 @@ def experiment(experiment_comment=None, overwrite=False):
     # Experiment
     n_repetitions = 5
     
-    n_timesteps = 1_01
+    n_timesteps = 1_000_000
     eval_interval = n_timesteps//100
     
     hp = dict(num_timesteps = n_timesteps, eval_interval = eval_interval, n = 30, pol_lr=1e-3, val_lr=1e-3, gamma=0.92, entropy_coef=0.01)

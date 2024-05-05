@@ -72,7 +72,7 @@ class PolicyNetwork(nn.Module):
             action_distr = torch.distributions.Categorical(out)
         else:
             mean = self.mean_layer(x)
-            std = torch.exp(self.std_layer(x)) # To keep positive
+            std = nn.functional.softplus(self.std_layer(x)) # To keep positive
             action_distr = torch.distributions.Normal(mean, std)
         
         action = action_distr.sample()
