@@ -28,6 +28,9 @@ class LearningCurvePlot:
         else:
             self.ax.plot(x,y)
     
+    def add_shaded_region(self, x, y1, y2, alpha=1):
+        self.ax.fill_between(x, y1, y2, alpha=alpha)
+    
     def set_ylim(self,lower,upper):
         self.ax.set_ylim([lower,upper])
 

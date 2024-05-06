@@ -1,0 +1,9 @@
+box2d-py==2.3.5
+gymnasium==0.29.1
+matplotlib==3.8.3
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.12.0
+torch==2.3.0
+tqdm==4.66.2
+swig==4.2.1
